@@ -1,0 +1,118 @@
+# Payment Bot
+
+Telegram bot that sells time-limited access to a private channel. Users pick a tariff, pay via LiqPay, and receive a one-time invite link. The bot reminds them before the subscription ends and removes them from the channel when it expires.
+
+## Features
+
+- Tariffs: 1 month, 3 months, lifetime
+- LiqPay checkout link generated per order
+- Payment callback with signature verification, amount/currency check and idempotent handling
+- Subscriptions: activation, extension of an active subscription, expiry
+- One-time invite links (24h, single use) and `/access` to re-issue a link
+- Scheduler: reminder 3 days before expiry, automatic removal from the channel
+- Admin commands (`/stats`, `/payments`, `/subscribers`), access controlled by membership in a Telegram admin group
+- Docker Compose setup, migrations applied on startup
+
+## Tech stack
+
+Python 3.13, aiogram 3, FastAPI + Uvicorn, SQLAlchemy 2.0 (async) + asyncpg, PostgreSQL 16, Alembic, APScheduler 3, pydantic-settings, Docker Compose.
+
+## How a payment flows
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant B as Bot (aiogram)
+    participant DB as PostgreSQL
+    participant L as LiqPay
+    participant A as API (FastAPI)
+
+    U->>B: /start, choose tariff
+    B->>DB: create order (pending)
+    B->>U: "Pay" button with signed LiqPay link
+    U->>L: pays
+    L->>A: POST /liqpay/callback (data, signature)
+    A->>A: verify signature, amount, currency
+    A->>DB: order=paid, activate/extend subscription (one transaction)
+    A->>U: confirmation + invite link
+```
+
+## Project structure
+
+```
+app/
+├── api/          # FastAPI: LiqPay callback, DB session dependency
+├── bot/          # handlers, keyboards, middleware, admin filter
+├── db/           # models, session, repositories, seed
+├── services/     # liqpay, subscriptions, access, stats, admin
+├── scheduler.py  # reminders and expiry jobs
+├── config.py     # settings from environment
+└── main.py       # runs the bot, the API and the scheduler in one process
+alembic/          # migrations
+scripts/          # helper scripts (callback simulation, channel checks)
+```
+
+## Quick start (Docker)
+
+1. Create a bot with @BotFather, a private channel (add the bot as admin with the rights to invite and ban users) and an admin group (add the bot).
+2. Copy the config and fill in the values:
+   ```bash
+   cp .env.example .env
+   ```
+3. Run:
+   ```bash
+   docker compose up -d --build
+   docker compose logs -f app
+   ```
+
+`PUBLIC_URL` must be a public HTTPS address that LiqPay can reach (use a tunnel such as ngrok or Cloudflare Tunnel during development, a real domain in production).
+
+## Local development
+
+```bash
+docker compose up -d db
+python -m venv venv && source venv/bin/activate   # Windows: venv\Scripts\activate
+pip install -r requirements.txt
+alembic upgrade head
+python -m app.db.seed
+python -m app.main
+```
+
+Run everything from the project root, using `python -m`.
+
+## Configuration
+
+| Variable | Description |
+|---|---|
+| `BOT_TOKEN` | Telegram bot token |
+| `CHANNEL_ID` | ID of the private channel with the content |
+| `ADMIN_GROUP_ID` | ID of the admin group; its members can use admin commands |
+| `POSTGRES_*` | Database credentials, host and port |
+| `LIQPAY_PUBLIC_KEY`, `LIQPAY_PRIVATE_KEY` | LiqPay keys (sandbox keys for testing) |
+| `PUBLIC_URL` | Public HTTPS base URL used for the LiqPay callback |
+
+## Commands
+
+| Command | Who | Description |
+|---|---|---|
+| `/start` | everyone | show tariffs, create an order |
+| `/access` | active subscribers | get a new invite link |
+| `/stats`, `/payments`, `/subscribers` | admins | revenue, last payments, active subscribers |
+
+## Testing the payment flow without LiqPay
+
+`scripts/fake_callback.py` sends a correctly signed callback to the local API:
+
+```bash
+python -m scripts.fake_callback <order_uuid> <amount>
+```
+
+It is used to verify the signature check, the amount check, idempotency (a repeated callback changes nothing) and subscription extension.
+
+## Status and limitations
+
+- The callback logic is verified with simulated callbacks. A real LiqPay sandbox payment has not been run end-to-end yet, so the exact callback fields and statuses (`success` / `sandbox`) should be confirmed against the first real callback.
+- The scheduler runs inside the application process, so run a single instance (several instances would duplicate jobs).
+- The bot uses long polling.
+- No automated tests yet.
+- Channel owners and admins cannot be removed by a bot, so their subscriptions are only deactivated.
